@@ -160,7 +160,7 @@ or double-click `run_backend.bat`. Open http://127.0.0.1:8000/docs and try `POST
 { "repo_url": "https://github.com/psf/requests" }
 ```
 
-Optional settings (environment variables): `OLLAMA_URL`, `OLLAMA_MODEL`, `LLM_BACKEND` (`auto`, `ollama` or `huggingface`), `HF_DTYPE` (`bfloat16` or `float32`).
+Optional settings (environment variables): `OLLAMA_URL`, `OLLAMA_MODEL`, `HF_TOKEN`, `HF_API_MODEL`, `LLM_BACKEND` (`auto`, `ollama`, `api` or `huggingface`), `HF_DTYPE` (`bfloat16` or `float32`).
 
 ## 12. Streamlit Cloud Deployment
 
@@ -171,7 +171,15 @@ Optional settings (environment variables): `OLLAMA_URL`, `OLLAMA_MODEL`, `LLM_BA
 5. Under **Advanced settings**, pick **Python 3.11** (the PyTorch wheels are best supported there).
 6. Click **Deploy**. The first build installs PyTorch and takes several minutes.
 
-On the cloud there is no Ollama, so the app uses Qwen/Qwen2.5-0.5B-Instruct through Transformers. The first analysis downloads the model and is slow. After that the model stays cached in memory (`st.cache_resource`) until the app restarts. The free tier has limited CPU and RAM, so expect a response in roughly a minute or more and use small repositories for the demo.
+**Recommended for the cloud: add a free Hugging Face token.** Create one at https://huggingface.co/settings/tokens (type "Read", or a fine-grained token with "Make calls to Inference Providers"). In Streamlit Cloud open your app, then **Settings → Secrets**, paste the line below and save:
+
+```
+HF_TOKEN = "hf_xxxxxxxxxxxxxxxx"
+```
+
+With a token the app calls the hosted Hugging Face Inference API (Qwen 2.5, model name in `HF_API_MODEL`), so nothing is downloaded and almost no RAM is used. Results arrive in seconds. Without a token it falls back to the slow in-app Transformers path described next.
+
+On the cloud there is no Ollama, so without a token the app uses Qwen/Qwen2.5-0.5B-Instruct through Transformers. The first analysis downloads the model and is slow. After that the model stays cached in memory (`st.cache_resource`) until the app restarts. The free tier has limited CPU and RAM, so expect a response in roughly a minute or more and use small repositories for the demo.
 
 ```
 git init

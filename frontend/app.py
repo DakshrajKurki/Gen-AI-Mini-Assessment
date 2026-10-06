@@ -399,7 +399,8 @@ with st.sidebar:
     )
     st.caption(
         "AI engine: **Ollama** if it is running on this computer, otherwise "
-        "**Hugging Face Transformers** (used on Streamlit Cloud). Same model family: Qwen 2.5 0.5B."
+        "the **Hugging Face hosted API** when a token is set in Streamlit Secrets (used on Streamlit Cloud), "
+        "else local Transformers (slow)."
     )
 
 # ------------------------------------------------------------------- input --
@@ -414,12 +415,12 @@ with st.form("analyze_form"):
     with col_a:
         deep_scan = st.checkbox(
             "Deep scan: describe every important file and folder",
-            value=True,
-            help="Adds a File Guide and Folder Guide written by the AI. Slower, but explains the whole repository.",
+            value=False,
+            help="Adds a File Guide and Folder Guide written by the AI. Much slower (one AI call per file). Leave it off for a fast overview.",
         )
     with col_b:
         n_files = st.select_slider(
-            "Files to describe", options=[5, 10, 15, 20, 30], value=15,
+            "Files to describe", options=[5, 10, 15, 20, 30], value=5,
             help="More files = a fuller guide but a longer wait (about 5-10 seconds per file on a laptop).",
         )
     submitted = st.form_submit_button("Analyze Repository", type="primary")

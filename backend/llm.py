@@ -39,8 +39,12 @@ OLLAMA_TIMEOUT = 300           # seconds to wait for Ollama to finish writing
 OLLAMA_NUM_CTX = 8192          # keep constant: changing it makes Ollama reload the model
 
 HF_MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
-HF_MAX_INPUT_TOKENS = 4500     # context is trimmed if the prompt is longer
-HF_MAX_NEW_TOKENS = 600
+# Hosted Hugging Face Inference API (used online when a token is set; no model download, no RAM use)
+HF_API_URL = os.getenv("HF_API_URL", "https://router.huggingface.co/v1/chat/completions")
+HF_API_MODEL = os.getenv("HF_API_MODEL", "Qwen/Qwen2.5-7B-Instruct")
+HF_API_TIMEOUT = 120
+HF_MAX_INPUT_TOKENS = 3000    # context is trimmed if the prompt is longer
+HF_MAX_NEW_TOKENS = 450
 HF_MAX_SECONDS = 240           # generation stops after this long
 
 LLM_BACKEND = os.getenv("LLM_BACKEND", "auto").lower()
@@ -157,6 +161,41 @@ def _explain_with_ollama(context_text: str) -> str:
         raise OllamaUnavailable(reason)
     messages = build_messages(context_text)
     return _ollama_generate(messages[0]["content"], messages[1]["content"], num_predict=900)
+
+
+# ----------------------------------------- Hugging Face hosted API (online) ----
+def hf_token() -> str:
+    """Token for the hosted API. On Streamlit Cloud, top-level Secrets become env vars."""
+    return (os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACEHUB_API_TOKEN") or "").strip()
+
+
+class ApiUnavailable(Exception):
+    """No token, or the hosted API could not be used (triggers the local fallback)."""
+
+
+def _hf_api_generate(messages: list[dict], max_tokens: int) -> str:
+    token = hf_token()
+    if not token:
+        raise ApiUnavailable("No Hugging Face token is set.")
+    payload = {"model": HF_API_MODEL, "messages": messages, "max_tokens": max_tokens,
+               "temperature": 0.1, "stream": False}
+    try:
+        resp = requests.post(HF_API_URL, json=payload, timeout=HF_API_TIMEOUT,
+                             headers={"Authorization": f"Bearer {token}"})
+    except requests.exceptions.Timeout as exc:
+        raise ApiUnavailable("The hosted AI model took too long to answer.") from exc
+    except requests.RequestException as exc:
+        raise ApiUnavailable("Could not reach the hosted AI model.") from exc
+    if not resp.ok:
+        logger.warning("HF API HTTP %s: %s", resp.status_code, resp.text[:300])
+        raise ApiUnavailable(f"The hosted AI model returned an error (HTTP {resp.status_code}).")
+    try:
+        text = (resp.json()["choices"][0]["message"]["content"] or "").strip()
+    except (ValueError, KeyError, IndexError, TypeError) as exc:
+        raise ApiUnavailable("The hosted AI model sent an unreadable reply.") from exc
+    if not text:
+        raise ApiUnavailable("The hosted AI model returned an empty answer.")
+    return text
 
 
 # -------------------------------------------------- Hugging Face (in-process) -
@@ -281,6 +320,17 @@ def explain_repository(repository_context) -> ExplanationResult:
                 raise LLMError(str(exc)) from exc
             logger.info("Falling back to Hugging Face Transformers.")
 
+    if LLM_BACKEND in ("auto", "api") and hf_token():
+        try:
+            messages = build_messages(context_text[:12000])
+            text = _hf_api_generate(messages, 900)
+            return ExplanationResult(text, f"Hugging Face API · {HF_API_MODEL}")
+        except ApiUnavailable as exc:
+            logger.warning("Hosted API not usable (%s)", exc)
+            if LLM_BACKEND == "api":
+                raise LLMError(str(exc)) from exc
+            logger.info("Falling back to local Transformers.")
+
     try:
         text = _explain_with_huggingface(context_text)
         return ExplanationResult(text, f"Hugging Face · {HF_MODEL}")
@@ -313,17 +363,23 @@ def pick_engine() -> str:
     """'ollama' if it is running with our model, otherwise 'huggingface'."""
     if LLM_BACKEND == "huggingface":
         return "huggingface"
+    if LLM_BACKEND == "api":
+        return "api"
     ready, reason = ollama_status()
     if ready:
         return "ollama"
     if LLM_BACKEND == "ollama":
         raise LLMError(reason)
-    return "huggingface"
+    return "api" if hf_token() else "huggingface"
 
 
 def _short_answer(engine: str, system: str, user: str, max_tokens: int = 90) -> str:
     if engine == "ollama":
         return _ollama_generate(system, user, num_predict=max_tokens)
+    if engine == "api":
+        return _hf_api_generate(
+            [{"role": "system", "content": system}, {"role": "user", "content": user}], max_tokens
+        )
     return _hf_generate(
         [{"role": "system", "content": system}, {"role": "user", "content": user}], max_tokens
     )
@@ -350,7 +406,7 @@ def _run_batch(jobs, engine, progress, label):
             if summary:
                 setter(summary)
             failures = 0
-        except (LLMError, OllamaUnavailable) as exc:
+        except (LLMError, OllamaUnavailable, ApiUnavailable) as exc:
             logger.warning("Could not describe %s: %s", name, exc)
             failures += 1
         except Exception as exc:  # e.g. Hugging Face runtime problems
