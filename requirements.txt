@@ -1,13 +1,14 @@
-fastapi>=0.110
-uvicorn[standard]>=0.29
-pydantic>=2.6
-GitPython>=3.1
-httpx>=0.27
-requests>=2.31
-python-multipart>=0.0.9
-streamlit>=1.42
+# Streamlit Cloud / Linux: use the small CPU-only PyTorch build (the default Linux wheel is ~2 GB+ with CUDA).
+# On Windows/macOS this line is harmless.
+--extra-index-url https://download.pytorch.org/whl/cpu
 
-# Only needed if you choose "Hugging Face (local)" instead of Ollama:
-# transformers>=4.44
-# torch
-# accelerate
+streamlit
+gitpython
+requests
+fastapi
+uvicorn
+pydantic
+transformers
+torch
+accelerate
+safetensors

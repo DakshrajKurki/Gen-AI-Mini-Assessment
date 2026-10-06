@@ -1,0 +1,15 @@
+venv/
+.venv/
+__pycache__/
+*.pyc
+.env
+.idea/
+.vscode/
+.DS_Store
+
+# Models, temporary clones and generated files must never be committed
+*.safetensors
+*.bin
+*.gguf
+repolens_*/
+*.log
