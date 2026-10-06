@@ -22,6 +22,7 @@ import json
 import logging
 import os
 import re
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -37,6 +38,7 @@ CONFIG_CHARS = 800
 SOURCE_CHARS = 1_200       # per source file
 MAX_CONFIG_FILES = 3
 MAX_FILE_BYTES = 300_000   # larger files are probably generated: skip
+NOTEBOOK_MAX_BYTES = 5_000_000   # notebooks are big JSON files (outputs/images); only the code is used
 MAX_FILES_SCANNED = 20_000 # stop walking absurdly large repositories
 
 # ----------------------------------------------------------- file rules ----
@@ -57,6 +59,10 @@ LANGUAGES = {
     ".ts": "TypeScript", ".tsx": "TypeScript (React)", ".java": "Java",
     ".cpp": "C++", ".c": "C", ".cs": "C#", ".go": "Go", ".rs": "Rust",
     ".php": "PHP", ".html": "HTML", ".css": "CSS", ".sql": "SQL",
+    ".ipynb": "Jupyter Notebook",
+    ".h": "C/C++ Header", ".hpp": "C++", ".rb": "Ruby", ".kt": "Kotlin", ".swift": "Swift",
+    ".dart": "Dart", ".r": "R", ".scala": "Scala", ".sh": "Shell", ".vue": "Vue",
+    ".scss": "SCSS", ".lua": "Lua", ".pl": "Perl", ".ps1": "PowerShell", ".jl": "Julia",
 }
 SOURCE_EXTENSIONS = set(LANGUAGES)
 
@@ -65,11 +71,15 @@ MANIFEST_NAMES = [  # in order of usefulness
     "go.mod", "cargo.toml", "composer.json",
 ]
 ENTRY_NAMES = {
+    "main.rb", "app.rb", "config.ru", "main.kt", "main.swift", "main.dart", "main.r", "app.r",
     "main.py", "app.py", "server.py", "index.py", "manage.py", "wsgi.py", "__main__.py",
     "index.js", "server.js", "app.js", "main.js", "index.ts", "main.ts", "app.ts",
     "app.jsx", "app.tsx", "main.jsx", "main.tsx", "main.go", "main.rs", "main.c",
     "main.cpp", "program.cs", "main.java", "application.java", "index.php", "index.html",
 }
+# Used only when a repo has no supported source code (docs, data, config repos).
+FALLBACK_TEXT_EXTENSIONS = {".md", ".rst", ".txt", ".json", ".yml", ".yaml", ".toml", ".xml", ".ini", ".cfg", ".csv"}
+MAX_FALLBACK_FILES = 5
 IMPORTANT_FOLDERS = {"src", "app", "lib", "core", "backend", "server", "api", "frontend", "cmd"}
 # Code in these folders is usually demo/helper code, not the heart of the project.
 LOW_VALUE_FOLDERS = {
@@ -93,8 +103,7 @@ MAX_SYMBOLS = 10
 OTHER_LANGUAGES = {
     ".md": "Markdown", ".rst": "reStructuredText", ".txt": "Text", ".json": "JSON",
     ".yml": "YAML", ".yaml": "YAML", ".toml": "TOML", ".ini": "Config", ".cfg": "Config",
-    ".xml": "XML", ".sh": "Shell", ".bat": "Batch", ".ipynb": "Notebook", ".rb": "Ruby",
-    ".kt": "Kotlin", ".swift": "Swift", ".vue": "Vue", ".scss": "SCSS", ".env": "Config",
+    ".xml": "XML", ".bat": "Batch", ".env": "Config",
     ".gradle": "Gradle", ".csv": "Data",
 }
 SPECIAL_FILES = {"dockerfile": "Docker", "makefile": "Makefile", "license": "License", "procfile": "Config"}
@@ -112,6 +121,14 @@ _SYMBOL_PATTERNS = {
     ".php": r"\b(?:function|class|interface|trait)\s+([A-Za-z_]\w*)",
     ".sql": r"(?i)create\s+(?:or\s+replace\s+)?(?:table|view|function|procedure)\s+(?:if\s+not\s+exists\s+)?([\w.]+)",
 }
+_SYMBOL_PATTERNS[".ipynb"] = _SYMBOL_PATTERNS[".py"]
+_SYMBOL_PATTERNS[".rb"] = r"^\s*(?:def|class|module)\s+([A-Za-z_][\w:.?!]*)"
+_SYMBOL_PATTERNS[".kt"] = r"\b(?:fun|class|object|interface)\s+([A-Za-z_]\w*)"
+_SYMBOL_PATTERNS[".swift"] = r"\b(?:func|class|struct|enum|protocol)\s+([A-Za-z_]\w*)"
+_SYMBOL_PATTERNS[".scala"] = r"\b(?:def|class|object|trait)\s+([A-Za-z_]\w*)"
+_SYMBOL_PATTERNS[".dart"] = r"\bclass\s+([A-Za-z_]\w*)"
+_SYMBOL_PATTERNS[".r"] = r"^([A-Za-z_.][\w.]*)\s*<-\s*function"
+_SYMBOL_PATTERNS[".sh"] = r"^(?:function\s+)?([A-Za-z_]\w*)\s*\(\)"
 _SYMBOL_PATTERNS[".jsx"] = _SYMBOL_PATTERNS[".ts"] = _SYMBOL_PATTERNS[".tsx"] = _SYMBOL_PATTERNS[".js"]
 
 
@@ -210,7 +227,7 @@ def build_repository_context(repo_path: str | os.PathLike) -> RepositoryContext:
     if not chosen:
         raise RepositoryError(
             "No readable source code was found. This tool understands Python, JavaScript, "
-            "TypeScript, Java, C/C++, C#, Go, Rust, PHP, HTML, CSS and SQL projects."
+            "TypeScript, Java, C/C++, C#, Go, Rust, PHP, HTML, CSS, SQL and Jupyter notebook projects."
         )
 
     entries: list[FileEntry] = []
@@ -232,7 +249,13 @@ def build_repository_context(repo_path: str | os.PathLike) -> RepositoryContext:
         sections.append(_format_section(cand, kind, text, was_truncated))
 
     if not entries:
-        raise RepositoryError("The files in this repository could not be read as text.")
+        found = ", ".join(c.rel for c in all_files[:5]) + (" ..." if len(all_files) > 5 else "")
+        raise RepositoryError(
+            "There is not enough readable content in this repository: no supported source code "
+            "and the README is empty or very short. "
+            f"Files found: {found}. RepoLens understands Python, JavaScript, TypeScript, Java, C/C++, "
+            "C#, Go, Rust, PHP, HTML, CSS, SQL and Jupyter notebooks."
+        )
 
     header = [
         "# REPOSITORY CONTEXT",
@@ -365,12 +388,23 @@ def _choose_files(candidates: list[_Candidate]) -> list[tuple[_Candidate, str, i
     # 3) source files, best score first
     sources = [
         c for c in candidates
-        if c.ext in SOURCE_EXTENSIONS and c.rel not in used and 0 < c.size <= MAX_FILE_BYTES
+        if c.ext in SOURCE_EXTENSIONS and c.rel not in used and 0 < c.size <= _max_bytes(c.ext)
     ]
     sources.sort(key=lambda c: (-_score(c), c.rel))
     for c in sources:
         kind = "Entry point" if c.name in ENTRY_NAMES else "Source"
         chosen.append((c, kind, SOURCE_CHARS))
+
+    # 4) no supported source code at all (docs / data / config repo): use text and data files
+    if not sources:
+        texts = [
+            c for c in candidates
+            if c.ext in FALLBACK_TEXT_EXTENSIONS and c.rel not in used and 0 < c.size <= MAX_FILE_BYTES
+            and not c.name.startswith("readme")
+        ]
+        texts.sort(key=lambda c: (c.depth, -c.size, c.rel))
+        for c in texts[:MAX_FALLBACK_FILES]:
+            chosen.append((c, "Data" if c.ext == ".csv" else "Document", CONFIG_CHARS))
     return chosen
 
 
@@ -420,13 +454,13 @@ def _build_inventory(candidates: list[_Candidate]) -> list[InventoryItem]:
     items: list[InventoryItem] = []
     for c in eligible:
         lines, symbols, snippet = None, [], ""
-        if c.ext in SOURCE_EXTENSIONS and 0 < c.size <= MAX_FILE_BYTES:
+        if c.ext in SOURCE_EXTENSIONS and 0 < c.size <= _max_bytes(c.ext):
             try:
                 data = c.abs.read_bytes()
             except OSError:
                 data = b""
-            if data and b"\x00" not in data[:4096]:
-                text = data.decode("utf-8", errors="replace")
+            text = _source_text(c.abs, data) if data else None
+            if text:
                 lines = text.count("\n") + 1
                 symbols = _extract_symbols(c.ext, text[:150_000])
                 if c.rel in snippet_paths:
@@ -496,19 +530,59 @@ def _format_index(inventory: list[InventoryItem], folders: list[FolderInfo]) -> 
     return "\n".join(lines)
 
 
+# ------------------------------------------------------------ notebooks -----
+def _max_bytes(ext: str) -> int:
+    return NOTEBOOK_MAX_BYTES if ext == ".ipynb" else MAX_FILE_BYTES
+
+
+def _notebook_text(data: bytes) -> str | None:
+    """Turn a Jupyter notebook (JSON) into plain text: code cells as code, markdown
+    cells as comments. Outputs (tables, plots, images) are dropped."""
+    try:
+        nb = json.loads(data.decode("utf-8", errors="replace"))
+        cells = nb.get("cells")
+        if cells is None:                       # very old notebook format
+            cells = [c for ws in nb.get("worksheets", []) for c in ws.get("cells", [])]
+    except (ValueError, AttributeError):
+        return None
+    parts: list[str] = []
+    for cell in cells:
+        source = cell.get("source", cell.get("input", ""))
+        source = "".join(source) if isinstance(source, list) else str(source)
+        source = source.strip()
+        if not source:
+            continue
+        if cell.get("cell_type") == "markdown":
+            parts.append("\n".join("# " + line for line in source.splitlines()))
+        elif cell.get("cell_type") in ("code", None):
+            parts.append(source)
+    return "\n\n".join(parts)
+
+
+def _source_text(path: Path, data: bytes) -> str | None:
+    """Decode a file's bytes into text; notebooks are converted to code."""
+    if path.suffix.lower() == ".ipynb":
+        return _notebook_text(data)
+    if b"\x00" in data[:4096]:
+        return None
+    return data.decode("utf-8", errors="replace").replace("\r\n", "\n")
+
+
 # ----------------------------------------------------------- file reading ---
 def _read_text(path: Path, limit: int) -> tuple[str, bool] | None:
     """Read at most `limit` characters. Returns (text, was_truncated) or None."""
+    is_notebook = path.suffix.lower() == ".ipynb"
     try:
         with open(path, "rb") as fh:
-            data = fh.read(limit * 4 + 4)  # UTF-8 uses up to 4 bytes per character
+            # UTF-8 uses up to 4 bytes per character; notebooks must be read whole (JSON).
+            data = fh.read(NOTEBOOK_MAX_BYTES if is_notebook else limit * 4 + 4)
             more_on_disk = bool(fh.read(1))
     except OSError:
         return None
-    if b"\x00" in data[:4096]:             # binary file
+    text = _source_text(path, data)
+    if text is None:
         return None
-    text = data.decode("utf-8", errors="replace").replace("\r\n", "\n")
-    truncated = more_on_disk or len(text) > limit
+    truncated = (more_on_disk and not is_notebook) or len(text) > limit
     if len(text) > limit:
         cut = text[:limit]
         newline = cut.rfind("\n")
@@ -531,7 +605,7 @@ def _format_section(c: _Candidate, kind: str, text: str, truncated: bool) -> str
     note = "\n... [file truncated]" if truncated else ""
     if kind == "README":
         return f"## README ({c.rel})\n{text}{note}"
-    lang = c.ext.lstrip(".")
+    lang = "python" if c.ext == ".ipynb" else c.ext.lstrip(".")
     return f"## File: {c.rel}  [{kind}]\n```{lang}\n{text}{note}\n```"
 
 
@@ -564,8 +638,31 @@ def _read_dependencies(candidates: list[_Candidate], limit: int = 25) -> list[st
                 found.append(re.split(r"[<>=!~\[;@ ]", spec.strip())[0])
         else:  # pom.xml
             found += re.findall(r"<artifactId>([^<]+)</artifactId>", raw)
+    if not found:   # no dependency file (typical for notebooks / small scripts): use the imports
+        found = _imported_packages(candidates)
     unique = list(dict.fromkeys(n for n in found if n))
     return unique[:limit]
+
+
+def _imported_packages(candidates: list[_Candidate], max_files: int = 8) -> list[str]:
+    """Third-party packages imported by the best Python files / notebooks."""
+    stdlib = getattr(sys, "stdlib_module_names", set())
+    pyfiles = sorted(
+        (c for c in candidates if c.ext in (".py", ".ipynb") and 0 < c.size <= _max_bytes(c.ext)),
+        key=lambda c: -_score(c),
+    )[:max_files]
+    own = {c.name.rsplit(".", 1)[0] for c in candidates}      # local modules are not packages
+    found: list[str] = []
+    for c in pyfiles:
+        try:
+            text = _source_text(c.abs, c.abs.read_bytes()) or ""
+        except OSError:
+            continue
+        for match in re.finditer(r"(?m)^\s*(?:import|from)\s+([A-Za-z_]\w*)", text):
+            name = match.group(1)
+            if name not in stdlib and name not in own and name not in found:
+                found.append(name)
+    return found
 
 
 # ----------------------------------------------------------- tree drawing ---

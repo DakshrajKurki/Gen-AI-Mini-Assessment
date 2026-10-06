@@ -8,3 +8,7 @@ font = "sans serif"
 
 [browser]
 gatherUsageStats = false
+
+[server]
+# Stops Streamlit's file watcher from poking into transformers sub-modules (noisy, harmless "torchvision" tracebacks)
+fileWatcherType = "none"

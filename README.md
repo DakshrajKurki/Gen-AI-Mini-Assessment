@@ -21,6 +21,7 @@ Build a working GenAI application that automates this first read-through:
 
 - Validates the URL (accepts repository URLs, rejects file, folder and non-GitHub links)
 - Shallow-clones the repository into a temporary folder and always deletes it afterwards
+- Reads Jupyter notebooks (`.ipynb`) by extracting their code and markdown cells, so data-analysis repos work too
 - Ignores junk (`.git`, `node_modules`, `venv`, `dist`, tests, lock files, binaries, huge files)
 - Prioritises README, config files (`requirements.txt`, `package.json`, ...), entry points, then central source files
 - Strict limits on files and characters, so even a 0.5B model gets a context it can handle
@@ -201,7 +202,7 @@ With Deep scan on, the **Repository map** tab shows a card for each folder (`src
 - Only public GitHub repositories are supported. Private repositories and other hosts are rejected.
 - Repositories over 300 MB are rejected.
 - Cloud inference runs on a shared CPU, so it is slow.
-- Only Python, JavaScript/TypeScript, Java, C/C++, C#, Go, Rust, PHP, HTML, CSS and SQL source files are analysed.
+- Source code in Python, JavaScript/TypeScript, Java, Kotlin, C/C++, C#, Go, Rust, PHP, Ruby, Swift, Dart, R, Scala, Shell, HTML/CSS, SQL and Jupyter notebooks (`.ipynb`) is analysed. Repositories with no code (only docs or CSV data) are explained from their text and data files. Repositories that contain only images or binaries, or an almost empty README, cannot be explained. For notebooks only the code and markdown cells are read, not the outputs.
 
 ## 15. Future Enhancements
 
