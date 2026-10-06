@@ -82,6 +82,38 @@ TREE_HIDDEN_EXTENSIONS = {
     ".ttf", ".eot", ".mp4", ".zip", ".lock",
 }
 
+# --- "whole repository" inventory (used for the file index and the File Guide) ---
+INDEX_CHARS = 2_500        # budget for the compact file index inside the LLM context
+MAX_INVENTORY = 250        # files listed in the inventory
+MAX_SNIPPETS = 30          # files that keep a short code snippet for per-file summaries
+SNIPPET_CHARS = 1_000
+MAX_SYMBOLS = 10
+
+# Display names for files that are not "source code" but still part of the repo.
+OTHER_LANGUAGES = {
+    ".md": "Markdown", ".rst": "reStructuredText", ".txt": "Text", ".json": "JSON",
+    ".yml": "YAML", ".yaml": "YAML", ".toml": "TOML", ".ini": "Config", ".cfg": "Config",
+    ".xml": "XML", ".sh": "Shell", ".bat": "Batch", ".ipynb": "Notebook", ".rb": "Ruby",
+    ".kt": "Kotlin", ".swift": "Swift", ".vue": "Vue", ".scss": "SCSS", ".env": "Config",
+    ".gradle": "Gradle", ".csv": "Data",
+}
+SPECIAL_FILES = {"dockerfile": "Docker", "makefile": "Makefile", "license": "License", "procfile": "Config"}
+
+# Regexes that find the main "things" defined in a file (classes, functions ...).
+_SYMBOL_PATTERNS = {
+    ".py": r"^(?:async\s+def|def|class)\s+([A-Za-z_]\w*)",
+    ".js": r"^(?:export\s+)?(?:default\s+)?(?:async\s+)?(?:function\*?|class)\s+([A-Za-z_$][\w$]*)"
+           r"|^(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?(?:\([^)]*\)|[\w$]+)\s*=>"
+           r"|^(?:module\.)?exports\.([A-Za-z_$][\w$]*)\s*=",
+    ".java": r"\b(?:class|interface|enum|record)\s+([A-Za-z_]\w*)",
+    ".cs": r"\b(?:class|interface|enum|struct|record)\s+([A-Za-z_]\w*)",
+    ".go": r"^func\s+(?:\([^)]*\)\s*)?([A-Za-z_]\w*)|^type\s+([A-Za-z_]\w*)\s+(?:struct|interface)",
+    ".rs": r"^\s*(?:pub\s+)?(?:async\s+)?(?:fn|struct|enum|trait)\s+([A-Za-z_]\w*)",
+    ".php": r"\b(?:function|class|interface|trait)\s+([A-Za-z_]\w*)",
+    ".sql": r"(?i)create\s+(?:or\s+replace\s+)?(?:table|view|function|procedure)\s+(?:if\s+not\s+exists\s+)?([\w.]+)",
+}
+_SYMBOL_PATTERNS[".jsx"] = _SYMBOL_PATTERNS[".ts"] = _SYMBOL_PATTERNS[".tsx"] = _SYMBOL_PATTERNS[".js"]
+
 
 # ---------------------------------------------------------------- results ---
 @dataclass
@@ -94,6 +126,29 @@ class FileEntry:
 
 
 @dataclass
+class InventoryItem:
+    """One file of the repository, described statically (no LLM involved)."""
+    path: str
+    language: str
+    size: int                       # bytes
+    lines: int | None               # None when the file was too large to count
+    symbols: list[str] = field(default_factory=list)   # classes / functions found
+    importance: float = 0.0
+    snippet: str = ""               # first ~1000 chars (only kept for the top files)
+    summary: str = ""               # filled in later by the LLM ("File Guide")
+
+
+@dataclass
+class FolderInfo:
+    """A top-level folder (or the repository root) and what it contains."""
+    name: str                       # "src", "backend", ... or "(root)"
+    file_count: int
+    languages: dict[str, int] = field(default_factory=dict)
+    files: list[str] = field(default_factory=list)      # most important files first
+    summary: str = ""               # filled in later by the LLM
+
+
+@dataclass
 class RepositoryContext:
     repo_name: str
     text: str                      # <- this is what is sent to the LLM
@@ -102,6 +157,8 @@ class RepositoryContext:
     languages: dict[str, int] = field(default_factory=dict)   # language -> file count
     dependencies: list[str] = field(default_factory=list)
     total_files: int = 0           # files scanned (after ignoring junk)
+    inventory: list[InventoryItem] = field(default_factory=list)
+    folders: list[FolderInfo] = field(default_factory=list)
 
     @property
     def analyzed_files(self) -> int:
@@ -146,6 +203,9 @@ def build_repository_context(repo_path: str | os.PathLike) -> RepositoryContext:
          if not c.name.startswith(".") and c.ext not in TREE_HIDDEN_EXTENSIONS],
     )
 
+    inventory = _build_inventory(candidates)
+    folders = _build_folders(candidates, inventory)
+
     chosen = _choose_files(candidates)
     if not chosen:
         raise RepositoryError(
@@ -189,6 +249,7 @@ def build_repository_context(repo_path: str | os.PathLike) -> RepositoryContext:
     if dependencies:
         header.append("Declared dependencies: " + ", ".join(dependencies))
     header += ["", "## Directory structure", structure, ""]
+    header += [_format_index(inventory, folders), ""]
 
     text = "\n".join(header) + "\n" + "\n\n".join(sections)
     return RepositoryContext(
@@ -199,6 +260,8 @@ def build_repository_context(repo_path: str | os.PathLike) -> RepositoryContext:
         languages=languages,
         dependencies=dependencies,
         total_files=len(all_files),
+        inventory=inventory,
+        folders=folders,
     )
 
 
@@ -311,6 +374,128 @@ def _choose_files(candidates: list[_Candidate]) -> list[tuple[_Candidate, str, i
     return chosen
 
 
+# ------------------------------------------------- whole-repo inventory ------
+def _language_of(c: _Candidate) -> str:
+    if c.ext in LANGUAGES:
+        return LANGUAGES[c.ext]
+    if c.name in SPECIAL_FILES:
+        return SPECIAL_FILES[c.name]
+    if c.name.startswith("readme"):
+        return "Markdown" if c.ext == ".md" else "Text"
+    return OTHER_LANGUAGES.get(c.ext, "")
+
+
+def _extract_symbols(ext: str, text: str) -> list[str]:
+    pattern = _SYMBOL_PATTERNS.get(ext)
+    if not pattern:
+        return []
+    found: list[str] = []
+    for match in re.finditer(pattern, text, flags=re.M):
+        name = next((g for g in match.groups() if g), None)
+        if name and name not in found and not name.startswith("__"):
+            found.append(name)
+            if len(found) >= MAX_SYMBOLS:
+                break
+    return found
+
+
+def _build_inventory(candidates: list[_Candidate]) -> list[InventoryItem]:
+    """List every (non-junk) file with language, size, line count and main symbols."""
+    eligible = [
+        c for c in candidates
+        if not c.name.startswith(".") and c.ext not in TREE_HIDDEN_EXTENSIONS and _language_of(c)
+    ]
+    # If there are too many files keep the most important ones.
+    eligible.sort(key=lambda c: (c.ext in SOURCE_EXTENSIONS, _score(c)), reverse=True)
+    eligible = eligible[:MAX_INVENTORY]
+
+    # Only the best source files keep a code snippet (for the per-file LLM summaries).
+    snippet_paths = {
+        c.rel for c in sorted(
+            (c for c in eligible if c.ext in SOURCE_EXTENSIONS and c.size > 0),
+            key=lambda c: (-_score(c), c.rel),
+        )[:MAX_SNIPPETS]
+    }
+
+    items: list[InventoryItem] = []
+    for c in eligible:
+        lines, symbols, snippet = None, [], ""
+        if c.ext in SOURCE_EXTENSIONS and 0 < c.size <= MAX_FILE_BYTES:
+            try:
+                data = c.abs.read_bytes()
+            except OSError:
+                data = b""
+            if data and b"\x00" not in data[:4096]:
+                text = data.decode("utf-8", errors="replace")
+                lines = text.count("\n") + 1
+                symbols = _extract_symbols(c.ext, text[:150_000])
+                if c.rel in snippet_paths:
+                    read = _read_text(c.abs, SNIPPET_CHARS)
+                    if read and len(read[0].strip()) >= 30:
+                        snippet = read[0]
+        items.append(InventoryItem(
+            path=c.rel, language=_language_of(c), size=c.size, lines=lines,
+            symbols=symbols, snippet=snippet,
+            importance=round(_score(c) + (20 if c.ext in SOURCE_EXTENSIONS else -20), 1),
+        ))
+    items.sort(key=lambda i: i.path)
+    return items
+
+
+def _build_folders(candidates: list[_Candidate], inventory: list[InventoryItem]) -> list[FolderInfo]:
+    """Group files by top-level folder. '(root)' holds files in the top directory."""
+    counts: dict[str, int] = {}
+    langs: dict[str, dict[str, int]] = {}
+    for c in candidates:
+        if c.name.startswith(".") or c.ext in TREE_HIDDEN_EXTENSIONS:
+            continue
+        key = c.rel.split("/")[0] if "/" in c.rel else "(root)"
+        counts[key] = counts.get(key, 0) + 1
+        lang = _language_of(c)
+        if lang:
+            langs.setdefault(key, {})
+            langs[key][lang] = langs[key].get(lang, 0) + 1
+
+    by_folder: dict[str, list[InventoryItem]] = {}
+    for item in inventory:
+        key = item.path.split("/")[0] if "/" in item.path else "(root)"
+        by_folder.setdefault(key, []).append(item)
+
+    folders = []
+    for key, n in counts.items():
+        ranked = sorted(by_folder.get(key, []), key=lambda i: -i.importance)
+        folders.append(FolderInfo(
+            name=key, file_count=n,
+            languages=dict(sorted(langs.get(key, {}).items(), key=lambda kv: -kv[1])),
+            files=[i.path for i in ranked[:12]],
+        ))
+    # real folders first (largest first), the root files last
+    folders.sort(key=lambda f: (f.name == "(root)", -f.file_count, f.name))
+    return folders
+
+
+def _format_index(inventory: list[InventoryItem], folders: list[FolderInfo]) -> str:
+    """Compact text index of the WHOLE repository for the LLM (budgeted)."""
+    lines = ["## Repository index (what is in the repository)"]
+    lines.append("Folders: " + "; ".join(
+        f"{f.name}{'' if f.name == '(root)' else '/'} ({f.file_count} file{'' if f.file_count == 1 else 's'}"
+        + (f", mostly {next(iter(f.languages))}" if f.languages else "") + ")"
+        for f in folders[:15]
+    ))
+    used = sum(len(x) for x in lines)
+    for item in sorted(inventory, key=lambda i: -i.importance):
+        detail = item.language + (f", {item.lines} lines" if item.lines else "")
+        if item.symbols:
+            detail += ": " + ", ".join(item.symbols[:6])
+        line = f"- {item.path} ({detail})"
+        if used + len(line) > INDEX_CHARS:
+            lines.append("- ... (more files not listed)")
+            break
+        lines.append(line)
+        used += len(line)
+    return "\n".join(lines)
+
+
 # ----------------------------------------------------------- file reading ---
 def _read_text(path: Path, limit: int) -> tuple[str, bool] | None:
     """Read at most `limit` characters. Returns (text, was_truncated) or None."""
@@ -374,7 +559,7 @@ def _read_dependencies(candidates: list[_Candidate], limit: int = 25) -> list[st
             except (ValueError, AttributeError):
                 pass
         elif c.name == "pyproject.toml":
-            block = re.search(r"(?m)^dependencies\s*=\s*\[(.*?)\]", raw, flags=re.S)
+            block = re.search(r"^dependencies\s*=\s*\[(.*?)\]", raw, flags=re.S)
             for spec in re.findall(r"[\"']([^\"']+)[\"']", block.group(1)) if block else []:
                 found.append(re.split(r"[<>=!~\[;@ ]", spec.strip())[0])
         else:  # pom.xml

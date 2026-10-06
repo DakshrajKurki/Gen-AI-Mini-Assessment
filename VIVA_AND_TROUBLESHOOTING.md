@@ -47,6 +47,12 @@ Local: Ollama runs the model as a separate server on your computer. Cloud: Strea
 **Why is the `sys.path` fix needed?**
 Streamlit runs `frontend/app.py` and puts only the `frontend/` folder on Python's import path. Our code lives in `backend/`, one level up, so `import backend...` fails with `ModuleNotFoundError`. The first lines of `app.py` add the project root to `sys.path` before any backend import. (`backend/__init__.py` also has to exist so Python treats `backend` as a package.)
 
+**How does the app explain the whole repository with such a small model?**
+A 0.5B model cannot read a whole repository at once, so the work is split into small steps (a "map then combine" approach). First a static scan builds an index of every folder and file with its classes and functions. That index goes into the main prompt. Then, in Deep scan, the model reads one important file at a time and writes one sentence about it. Finally it writes a sentence for each folder from those file sentences. Each step fits easily in the model's context window.
+
+**What is the difference between "Files read by AI" and "Files described"?**
+"Files read by AI" are the README, config files and source files sent whole to the model for the main overview. "Files described" are the files the model summarised one by one in Deep scan.
+
 **What are the limitations?**
 A small model can make mistakes or repeat itself. Only a slice of a big repository is read. Only public GitHub repositories work. Cloud inference is slow on a shared CPU. Output quality varies from run to run and from repository to repository.
 
@@ -65,10 +71,11 @@ There is no explanation text in the code. The app has a button to show the exact
    - empty input → "Please enter a GitHub repository URL."
 2. **Local run with Ollama**: start Ollama, run the Streamlit app, analyze `psf/requests`. The engine metric should say **Ollama**.
 3. **Fallback**: stop Ollama (or set `OLLAMA_URL=http://localhost:9`) and analyze again. The first run downloads the Hugging Face model, then the engine should say **Hugging Face**.
-4. **Different languages**: try `expressjs/express` (JavaScript) and `pallets/flask` (Python).
-5. **API**: run `uvicorn backend.main:app --reload`, open `/docs`, call `GET /health` (expect `{"status":"ok"}`) and `POST /explain`.
-6. **Cleanup**: while or after running, check your temp folder (`%TEMP%` on Windows). No `repolens_*` folders should remain.
-7. **Streamlit Cloud**: open the deployed URL, analyze a small repository and wait for the first (slow) run to finish.
+4. **Deep scan**: tick "Deep scan", analyze a repository and open the **Repository map** and **File guide** tabs. Each folder and top files should have a sentence written by the AI. Untick it and analyze again to see the faster quick scan.
+5. **Different languages**: try `expressjs/express` (JavaScript) and `pallets/flask` (Python).
+6. **API**: run `uvicorn backend.main:app --reload`, open `/docs`, call `GET /health` (expect `{"status":"ok"}`) and `POST /explain`.
+7. **Cleanup**: while or after running, check your temp folder (`%TEMP%` on Windows). No `repolens_*` folders should remain.
+8. **Streamlit Cloud**: open the deployed URL, analyze a small repository and wait for the first (slow) run to finish.
 
 ---
 
@@ -88,5 +95,6 @@ There is no explanation text in the code. The app has a button to show the exact
 | "The server ran out of memory" (Streamlit Cloud) | Free tier RAM limit | Reboot the app from the Streamlit dashboard and try a smaller repository, or run locally |
 | `'streamlit' is not recognized` | Virtual environment not active | Run `venv\Scripts\activate`, or use `python -m streamlit run frontend/app.py` |
 | `pip install` of torch is very slow or huge | The default Linux wheel includes CUDA | Keep the `--extra-index-url .../whl/cpu` line in `requirements.txt` |
+| Deep scan is slow | One AI call per file and folder | Lower the "Files to describe" slider (try 5), or untick Deep scan |
 | First online analysis takes minutes | The model (about 1 GB) is downloading and loading | Wait. Later runs reuse the cached model. |
 | Streamlit Cloud build fails on torch | Python version too new | In Advanced settings choose Python 3.11 and redeploy |
